@@ -197,6 +197,39 @@ curl -X POST \
 [{"face":1,"box":[120,80,310,340],"score":0.98,"age":34,"gender":"male"}]
 ```
 
+### ROI — optional region of interest
+
+`/identify` and `/analyze` accept an optional query parameter `roi=x,y,w,h`
+with normalized coordinates (0..1) of the frame region to search. Without the
+parameter, the whole frame is processed and the response format is unchanged.
+
+```bash
+# identify only inside the door zone (x=5%, y=0, w=62%, h=70%)
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/identify?roi=0.05,0,0.62,0.7'
+
+# detect in the top 2/3 of the frame; box is returned in original frame coordinates
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/analyze?roi=0,0,1,0.667'
+```
+
+Rules:
+
+- `x, y, w, h` are numbers from 0 to 1, comma-separated without spaces. An
+  invalid format returns `400 {"error":"..."}`.
+- The region is clipped to the frame bounds. A side smaller than 32 px returns
+  `422 "roi too small (min side 32 px)"`.
+- In `/analyze`, the `box` coordinates are always returned in the coordinate
+  system of the original (uncropped) frame, which makes it easy to merge
+  results of several zones (deduplication by IoU).
+- Node-RED scenario: one frame, several requests with different `roi` values
+  (a narrow zone gives more zoom and better small-face detection, a wide zone
+  catches the rest), results are merged on the Node-RED side.
+
 Errors use the following shape:
 
 ```json

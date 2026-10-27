@@ -207,13 +207,19 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	roi, err := roiFromRequest(r)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
 		a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 		return
 	}
 
-	faces, err := a.ml.Embeddings(image)
+	faces, err := a.ml.EmbeddingsROI(image, roi)
 	if err != nil {
 		a.fail(r, w, http.StatusUnprocessableEntity, "face processing failed", err)
 		return
@@ -257,12 +263,17 @@ func (a *App) analyze(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	roi, err := roiFromRequest(r)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
 		a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 		return
 	}
-	path, err := a.ml.Analyze(image)
+	path, err := a.ml.AnalyzeROI(image, roi)
 	if err != nil {
 		a.fail(r, w, http.StatusUnprocessableEntity, "analysis failed", err)
 		return
@@ -334,6 +345,17 @@ func readImage(w http.ResponseWriter, r *http.Request, maxBodyBytes int64) ([]by
 		return nil, errors.New("empty image")
 	}
 	return b, nil
+}
+
+// roiFromRequest — необязательный query-параметр roi=x,y,w,h
+// (нормализованные координаты 0..1). Отсутствует → nil → весь кадр,
+// поведение как в оригинальном сервисе.
+func roiFromRequest(r *http.Request) (*engine.ROI, error) {
+	s := strings.TrimSpace(r.URL.Query().Get("roi"))
+	if s == "" {
+		return nil, nil
+	}
+	return engine.ParseROI(s)
 }
 
 func validID(id string) bool {
