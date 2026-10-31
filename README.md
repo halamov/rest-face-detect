@@ -230,6 +230,32 @@ Rules:
   (a narrow zone gives more zoom and better small-face detection, a wide zone
   catches the rest), results are merged on the Node-RED side.
 
+### Upscale — enlarge the frame before detection
+
+`/identify` and `/analyze` also accept an optional query parameter
+`upscale=N` (integer, 1..8). The frame (or the ROI crop, when `roi` is set
+too) is enlarged N times before face detection. This helps when the face in
+the frame is smaller than the detector's minimum size: a plain crop adds no
+pixels, upscaling makes the face large enough to be detected.
+
+```bash
+# detect a small face: crop the door zone and enlarge it 3x
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/identify?roi=0.25,0.1,0.35,0.7&upscale=3'
+```
+
+Rules:
+
+- `1..8`, integer. Anything else returns `400 {"error":"..."}`.
+- Default is `1` — without the parameter behavior is unchanged.
+- In `/analyze` with `upscale`, `box` is still returned in the coordinate
+  system of the original (uncropped, unscaled) frame.
+- Values above 3 give no systematic improvement: the embedding crop is
+  normalized to a fixed size inside the model, so extra scaling only adds
+  interpolation noise (and processing time).
+
 Errors use the following shape:
 
 ```json

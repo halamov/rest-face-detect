@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -212,6 +213,11 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	upscale, err := upscaleFromRequest(r)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
@@ -219,7 +225,7 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	faces, err := a.ml.EmbeddingsROI(image, roi)
+	faces, err := a.ml.EmbeddingsROI(image, roi, upscale)
 	if err != nil {
 		a.fail(r, w, http.StatusUnprocessableEntity, "face processing failed", err)
 		return
@@ -268,12 +274,17 @@ func (a *App) analyze(w http.ResponseWriter, r *http.Request) {
 		errorJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	upscale, err := upscaleFromRequest(r)
+	if err != nil {
+		errorJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
 		a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 		return
 	}
-	path, err := a.ml.AnalyzeROI(image, roi)
+	path, err := a.ml.AnalyzeROI(image, roi, upscale)
 	if err != nil {
 		a.fail(r, w, http.StatusUnprocessableEntity, "analysis failed", err)
 		return
@@ -356,6 +367,21 @@ func roiFromRequest(r *http.Request) (*engine.ROI, error) {
 		return nil, nil
 	}
 	return engine.ParseROI(s)
+}
+
+// upscaleFromRequest — необязательный query-параметр upscale=N (1..8).
+// Кадр (или ROI-кроп) увеличивается в N раз перед детекцией — помогает,
+// когда лицо меньше минимального размера детектора. Отсутствует → 1.
+func upscaleFromRequest(r *http.Request) (int, error) {
+	s := strings.TrimSpace(r.URL.Query().Get("upscale"))
+	if s == "" {
+		return 1, nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 1 || v > 8 {
+		return 0, errors.New("upscale must be an integer 1..8")
+	}
+	return v, nil
 }
 
 func validID(id string) bool {

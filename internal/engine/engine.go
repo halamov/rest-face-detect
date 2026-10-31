@@ -18,6 +18,7 @@ import (
 
 	"github.com/ebitengine/purego"
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 )
 
 type EmbeddingResult struct {
@@ -482,9 +483,20 @@ func encodeJPEG(img image.Image, quality int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// prepareCrop — декодирует картинку, вырезает ROI, возвращает JPEG-байты
-// кропа и его пиксельное смещение в исходном кадре.
-func (e *Engine) prepareCrop(data []byte, roi ROI) ([]byte, [2]int, error) {
+// upscaleImage увеличивает картинку в scale раз (Catmull-Rom).
+// Нужен, когда лицо в кадре меньше минимального размера детектора:
+// простой кроп (ROI) пиксели не добавляет, а апскейл делает лицо крупнее.
+func upscaleImage(img image.Image, scale int) image.Image {
+	b := img.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, b.Dx()*scale, b.Dy()*scale))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst
+}
+
+// prepareCrop — декодирует картинку, вырезает ROI, при scale > 1 увеличивает
+// кроп в scale раз; возвращает JPEG-байты и пиксельное смещение кропа
+// в исходном кадре.
+func (e *Engine) prepareCrop(data []byte, roi ROI, scale int) ([]byte, [2]int, error) {
 	img, err := decodeImage(data)
 	if err != nil {
 		return nil, [2]int{}, fmt.Errorf("invalid image: %w", err)
@@ -492,6 +504,9 @@ func (e *Engine) prepareCrop(data []byte, roi ROI) ([]byte, [2]int, error) {
 	crop, offset, err := cropROIImage(img, roi)
 	if err != nil {
 		return nil, [2]int{}, err
+	}
+	if scale > 1 {
+		crop = upscaleImage(crop, scale)
 	}
 	jpegBytes, err := encodeJPEG(crop, 95)
 	if err != nil {
@@ -501,26 +516,36 @@ func (e *Engine) prepareCrop(data []byte, roi ROI) ([]byte, [2]int, error) {
 }
 
 // EmbeddingsROI — эмбеддинги всех лиц, но только в области roi.
-// roi == nil — весь кадр (исходное поведение Embeddings).
-func (e *Engine) EmbeddingsROI(data []byte, roi *ROI) ([][]float32, error) {
-	if roi == nil {
+// scale > 1 — апскейл кропа перед детекцией (см. upscaleImage).
+// roi == nil и scale == 1 — исходное поведение Embeddings.
+func (e *Engine) EmbeddingsROI(data []byte, roi *ROI, scale int) ([][]float32, error) {
+	if roi == nil && scale <= 1 {
 		return e.Embeddings(data)
 	}
-	cropped, _, err := e.prepareCrop(data, *roi)
+	if roi == nil {
+		full := ROI{X: 0, Y: 0, W: 1, H: 1}
+		roi = &full
+	}
+	cropped, _, err := e.prepareCrop(data, *roi, scale)
 	if err != nil {
 		return nil, err
 	}
 	return e.Embeddings(cropped)
 }
 
-// AnalyzeROI — как Analyze, но только по области roi.
-// roi == nil — исходное поведение Analyze. Координаты "box" в ответе всегда
-// возвращаются в системе координат исходного (необрезанного) кадра.
-func (e *Engine) AnalyzeROI(data []byte, roi *ROI) ([]map[string]any, error) {
-	if roi == nil {
+// AnalyzeROI — как Analyze, но только по области roi; scale > 1 — апскейл.
+// roi == nil и scale == 1 — исходное поведение Analyze. Координаты "box" в
+// ответе всегда возвращаются в системе координат исходного (необрезанного,
+// неувеличенного) кадра.
+func (e *Engine) AnalyzeROI(data []byte, roi *ROI, scale int) ([]map[string]any, error) {
+	if roi == nil && scale <= 1 {
 		return e.Analyze(data)
 	}
-	cropped, offset, err := e.prepareCrop(data, *roi)
+	if roi == nil {
+		full := ROI{X: 0, Y: 0, W: 1, H: 1}
+		roi = &full
+	}
+	cropped, offset, err := e.prepareCrop(data, *roi, scale)
 	if err != nil {
 		return nil, err
 	}
@@ -528,16 +553,17 @@ func (e *Engine) AnalyzeROI(data []byte, roi *ROI) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	s := float32(scale)
 	ox, oy := float32(offset[0]), float32(offset[1])
 	for _, f := range faces {
 		box, ok := f["box"].([4]float32)
 		if !ok {
 			continue
 		}
-		box[0] += ox
-		box[1] += oy
-		box[2] += ox
-		box[3] += oy
+		box[0] = box[0]/s + ox
+		box[1] = box[1]/s + oy
+		box[2] = box[2]/s + ox
+		box[3] = box[3]/s + oy
 		f["box"] = box
 	}
 	return faces, nil
