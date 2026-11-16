@@ -38,9 +38,9 @@ type detectResponse struct {
 }
 
 type Engine struct {
-	mu sync.Mutex
-
+	mu  sync.Mutex
 	ctx uintptr
+	lib uintptr
 
 	abiVersion func() int32
 	load       func(string) uintptr
@@ -50,8 +50,13 @@ type Engine struct {
 	freeVec    func(uintptr)
 
 	embedRGB    func(uintptr, *byte, int32, int32, *uintptr, *int32) int32
-	detectJSON  func(uintptr, string) uintptr
-	analyzeJSON func(uintptr, string) uintptr
+	embedRGBBox func(uintptr, *byte, int32, int32, float32, float32, float32, float32, *uintptr, *int32) int32
+	embedRGBKps func(uintptr, *byte, int32, int32, *float32, *uintptr, *int32) int32
+	// embedBoxTried: facedetect_capi_embed_rgb_box регистрируется лениво
+	// (старые .so без него — RegisterLibFunc упал бы при старте).
+	embedBoxTried bool
+	detectJSON    func(uintptr, string) uintptr
+	analyzeJSON   func(uintptr, string) uintptr
 }
 
 const minEmbedSide = 192
@@ -69,7 +74,7 @@ func Load(libPath, modelPath string) (*Engine, error) {
 		return nil, fmt.Errorf("dlopen %s: %w", libPath, err)
 	}
 
-	e := &Engine{}
+	e := &Engine{lib: lib}
 
 	purego.RegisterLibFunc(&e.abiVersion, lib, "facedetect_capi_abi_version")
 	purego.RegisterLibFunc(&e.load, lib, "facedetect_capi_load")
@@ -138,6 +143,16 @@ func (e *Engine) EmbeddingsWithPreview(data []byte) ([]EmbeddingResult, error) {
 	log.Printf("engine: %d face(s) detected", len(dets))
 
 	out := make([]EmbeddingResult, 0, len(dets))
+	// Запасной RGB всего кадра для embed_box (координаты det.Box — в системе
+	// целого кадра; пересчёт в систему кропа с паддингом/апскейлом сложен, а
+	// warp в C++ берёт пиксели только вокруг бокса).
+	var fullRGB []byte
+	var fullW, fullH int
+	if !e.embedBoxTried {
+		e.embedBoxTried = true
+		e.registerEmbedBox()
+		e.registerEmbedKps()
+	}
 	for i, det := range dets {
 		crop, err := cropFace(img, det, 0.35)
 		if err != nil {
@@ -148,23 +163,59 @@ func (e *Engine) EmbeddingsWithPreview(data []byte) ([]EmbeddingResult, error) {
 		rgb := imageToRGB(crop)
 		embedding, err := e.embedRGBLocked(rgb, crop.Bounds().Dx(), crop.Bounds().Dy())
 		if err != nil {
-			// Fallback: если кроп с паддингом не прошёл эмбеддинг — пробуем
-			// чистый box-кроп без паддинга (маленькие/крайние лица).
-			if raw := cropFaceNoPad(img, det); raw != nil {
+			// Внутренний детектор .so отклонил кроп (маленькое лицо / профиль),
+			// хотя внешний детект лицо нашёл. Fallback'и — без повторного детекта:
+			//  1) embed_kps — warp по реальным landmark'ам внешнего детекта;
+			//  2) embed_box — warp по стандартному шаблону bbox (нет landmark'ов);
+			//  3) чистый box-кроп без паддинга через обычный embed.
+			// Координаты бокса/landmark'ов — в системе целого (ROI+upscale) кадра,
+			// поэтому fallback'и 1-2 гоняют весь кадр: warp в C++ берёт пиксели
+			// только вокруг лица.
+			if fullRGB == nil {
+				b := img.Bounds()
+				fullW, fullH = b.Dx(), b.Dy()
+				fullRGB = imageToRGB(img)
+			}
+			var kps [10]float32
+			for j := 0; j < 5; j++ {
+				kps[2*j] = det.Landmarks[j][0]
+				kps[2*j+1] = det.Landmarks[j][1]
+			}
+			var fallbackEmb []float32
+			var fallbackErr error
+			var usedFallback string
+			if hasLandmarks(kps) {
+				fallbackEmb, fallbackErr = e.embedRGBKpsLocked(fullRGB, fullW, fullH, kps)
+				usedFallback = "embed_kps"
+			}
+			if fallbackEmb == nil {
+				embBox, errBox := e.embedRGBBoxLocked(fullRGB, fullW, fullH, det.Box)
+				if errBox == nil {
+					fallbackEmb, usedFallback = embBox, "embed_box"
+				} else if fallbackErr == nil {
+					fallbackErr = errBox
+				}
+			}
+			if fallbackEmb != nil {
+				log.Printf("engine: face %d/%d: embed failed (%v) — %s OK (box=%v)",
+					i+1, len(dets), err, usedFallback, det.Box)
+				embedding = fallbackEmb
+				// превью остаётся паддингованный кроп
+			} else if raw := cropFaceNoPad(img, det); raw != nil {
 				rrgb := imageToRGB(raw)
-				if emb2, err2 := e.embedRGBLocked(rrgb, raw.Bounds().Dx(), raw.Bounds().Dy()); err2 == nil {
-					log.Printf("engine: face %d/%d: padded-crop embed failed (%v) — raw box crop OK",
-						i+1, len(dets), err)
-					crop, rgb, embedding = raw, rrgb, emb2
-					// continue into success path below
+				emb3, err3 := e.embedRGBLocked(rrgb, raw.Bounds().Dx(), raw.Bounds().Dy())
+				if err3 == nil {
+					log.Printf("engine: face %d/%d: embed failed (%v), embed_kps/box: %v — raw box crop OK",
+						i+1, len(dets), err, fallbackErr)
+					crop, rgb, embedding = raw, rrgb, emb3
 				} else {
-					log.Printf("engine: face %d/%d dropped at embed: %v (raw fallback: %v) (box=%v score=%.3f)",
-						i+1, len(dets), err, err2, det.Box, det.Score)
+					log.Printf("engine: face %d/%d dropped at embed: %v (kps/box: %v, raw: %v) (box=%v score=%.3f)",
+						i+1, len(dets), err, fallbackErr, err3, det.Box, det.Score)
 					continue
 				}
 			} else {
-				log.Printf("engine: face %d/%d dropped at embed: %v (box=%v score=%.3f)",
-					i+1, len(dets), err, det.Box, det.Score)
+				log.Printf("engine: face %d/%d dropped at embed: %v (kps/box: %v) (box=%v score=%.3f)",
+					i+1, len(dets), err, fallbackErr, det.Box, det.Score)
 				continue
 			}
 		}
@@ -264,6 +315,107 @@ func (e *Engine) embedRGBLocked(rgb []byte, width, height int) ([]float32, error
 	out := make([]float32, int(dim))
 	copy(out, src)
 	return out, nil
+}
+
+// embedRGBBoxLocked — эмбеддинг по явному боксу лица без внутреннего
+// повторного детекта (fallback для кропов, которые внутренний детектор
+// отклоняет: маленькие лица, большие профили). Требует
+// facedetect_capi_embed_rgb_box в .so; при его отсутствии — ошибка.
+// registerEmbedBox — ленивая регистрация facedetect_capi_embed_rgb_box:
+// в старых .so символа нет, RegisterLibFunc упал бы при старте.
+func (e *Engine) registerEmbedBox() {
+	defer func() {
+		if r := recover(); r != nil {
+			e.embedRGBBox = nil
+		}
+	}()
+	purego.RegisterLibFunc(&e.embedRGBBox, e.lib, "facedetect_capi_embed_rgb_box")
+}
+
+// registerEmbedKps — то же для facedetect_capi_embed_rgb_kps.
+func (e *Engine) registerEmbedKps() {
+	defer func() {
+		if r := recover(); r != nil {
+			e.embedRGBKps = nil
+		}
+	}()
+	purego.RegisterLibFunc(&e.embedRGBKps, e.lib, "facedetect_capi_embed_rgb_kps")
+}
+
+func (e *Engine) embedRGBBoxLocked(rgb []byte, width, height int, box [4]float32) ([]float32, error) {
+	if len(rgb) == 0 {
+		return nil, errors.New("empty RGB image")
+	}
+	if e.embedRGBBox == nil {
+		return nil, errors.New("embed_box unavailable in this libfacedetect")
+	}
+	var vec uintptr
+	var dim int32
+
+	rc := e.embedRGBBox(
+		e.ctx,
+		&rgb[0],
+		int32(width),
+		int32(height),
+		box[0],
+		box[1],
+		box[2],
+		box[3],
+		&vec,
+		&dim,
+	)
+	if rc != 0 || vec == 0 || dim <= 0 {
+		return nil, e.cError("embed_box")
+	}
+	defer e.freeVec(vec)
+
+	src := unsafe.Slice((*float32)(unsafe.Pointer(vec)), int(dim))
+	out := make([]float32, int(dim))
+	copy(out, src)
+	return out, nil
+}
+
+// embedRGBKpsLocked — эмбеддинг по реальным 5 точкам лица (из внешнего
+// детекта) без повторного детекта. Точнее embed_box на профилях: warp
+// строится по фактическим глазам/носу, а не шаблону.
+func (e *Engine) embedRGBKpsLocked(rgb []byte, width, height int, kps [10]float32) ([]float32, error) {
+	if len(rgb) == 0 {
+		return nil, errors.New("empty RGB image")
+	}
+	if e.embedRGBKps == nil {
+		return nil, errors.New("embed_kps unavailable in this libfacedetect")
+	}
+	var vec uintptr
+	var dim int32
+
+	rc := e.embedRGBKps(
+		e.ctx,
+		&rgb[0],
+		int32(width),
+		int32(height),
+		&kps[0],
+		&vec,
+		&dim,
+	)
+	if rc != 0 || vec == 0 || dim <= 0 {
+		return nil, e.cError("embed_kps")
+	}
+	defer e.freeVec(vec)
+
+	src := unsafe.Slice((*float32)(unsafe.Pointer(vec)), int(dim))
+	out := make([]float32, int(dim))
+	copy(out, src)
+	return out, nil
+}
+
+// hasLandmarks — не все ли kps нулевые (старые/пустые JSON-детекты).
+func hasLandmarks(kps [10]float32) bool {
+	for _, v := range kps {
+		if v != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) cError(op string) error {
