@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"log"
 	"math"
 	"os"
 	"strconv"
@@ -131,22 +132,45 @@ func (e *Engine) EmbeddingsWithPreview(data []byte) ([]EmbeddingResult, error) {
 		return nil, err
 	}
 	if len(dets) == 0 {
+		log.Printf("engine: 0 faces detected (image %d bytes)", len(data))
 		return []EmbeddingResult{}, nil
 	}
+	log.Printf("engine: %d face(s) detected", len(dets))
 
 	out := make([]EmbeddingResult, 0, len(dets))
-	for _, det := range dets {
-		crop, err := cropFace(img, det)
+	for i, det := range dets {
+		crop, err := cropFace(img, det, 0.35)
 		if err != nil {
+			log.Printf("engine: face %d/%d dropped at crop: %v (box=%v score=%.3f)",
+				i+1, len(dets), err, det.Box, det.Score)
 			continue
 		}
 		rgb := imageToRGB(crop)
 		embedding, err := e.embedRGBLocked(rgb, crop.Bounds().Dx(), crop.Bounds().Dy())
 		if err != nil {
-			continue
+			// Fallback: если кроп с паддингом не прошёл эмбеддинг — пробуем
+			// чистый box-кроп без паддинга (маленькие/крайние лица).
+			if raw := cropFaceNoPad(img, det); raw != nil {
+				rrgb := imageToRGB(raw)
+				if emb2, err2 := e.embedRGBLocked(rrgb, raw.Bounds().Dx(), raw.Bounds().Dy()); err2 == nil {
+					log.Printf("engine: face %d/%d: padded-crop embed failed (%v) — raw box crop OK",
+						i+1, len(dets), err)
+					crop, rgb, embedding = raw, rrgb, emb2
+					// continue into success path below
+				} else {
+					log.Printf("engine: face %d/%d dropped at embed: %v (raw fallback: %v) (box=%v score=%.3f)",
+						i+1, len(dets), err, err2, det.Box, det.Score)
+					continue
+				}
+			} else {
+				log.Printf("engine: face %d/%d dropped at embed: %v (box=%v score=%.3f)",
+					i+1, len(dets), err, det.Box, det.Score)
+				continue
+			}
 		}
 		preview, err := encodePreview(crop)
 		if err != nil {
+			log.Printf("engine: face %d/%d dropped at preview: %v", i+1, len(dets), err)
 			continue
 		}
 		out = append(out, EmbeddingResult{Embedding: embedding, Preview: preview})
@@ -258,7 +282,24 @@ func decodeImage(data []byte) (image.Image, error) {
 	return img, err
 }
 
-func cropFace(img image.Image, d Detection) (image.Image, error) {
+// cropFace — вырезает область лица по боксу детектора с паддингом pad
+// (доля от размера бокса, 0.35 — историческое значение) и увеличивает
+// результат до minEmbedSide.
+func cropFace(img image.Image, d Detection, pad float64) (image.Image, error) {
+	return cropBox(img, d, pad, true)
+}
+
+// cropFaceNoPad — то же самое, но без паддинга (fallback для кропа,
+// упавшего на эмбеддинге).
+func cropFaceNoPad(img image.Image, d Detection) image.Image {
+	crop, err := cropBox(img, d, 0, true)
+	if err != nil {
+		return nil
+	}
+	return crop
+}
+
+func cropBox(img image.Image, d Detection, pad float64, upscale bool) (image.Image, error) {
 	b := img.Bounds()
 
 	x1 := int(math.Floor(float64(d.Box[0])))
@@ -272,8 +313,8 @@ func cropFace(img image.Image, d Detection) (image.Image, error) {
 		return nil, errors.New("invalid face box")
 	}
 
-	padX := int(float64(w) * 0.35)
-	padY := int(float64(h) * 0.35)
+	padX := int(float64(w) * pad)
+	padY := int(float64(h) * pad)
 
 	x1 -= padX
 	y1 -= padY
@@ -305,7 +346,10 @@ func cropFace(img image.Image, d Detection) (image.Image, error) {
 			dst.Set(x, y, img.At(x+x1, y+y1))
 		}
 	}
-	return upscaleToMin(dst, minEmbedSide), nil
+	if upscale {
+		return upscaleToMin(dst, minEmbedSide), nil
+	}
+	return dst, nil
 }
 
 // upscaleToMin scales img up so both sides are at least minSide, preserving
