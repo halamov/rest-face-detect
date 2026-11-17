@@ -256,6 +256,44 @@ Rules:
   normalized to a fixed size inside the model, so extra scaling only adds
   interpolation noise (and processing time).
 
+### Fallback for faces rejected by the internal detector (fork feature)
+
+`/identify` crops a face (with padding) and asks the native library for an
+embedding. Inside the `.so` a second, internal detector re-checks the crop,
+and for small or profile views it answers "no face" — such a face used to be
+dropped silently, turning the event into an empty one.
+
+On an embedding failure the service now runs a fallback chain **without
+re-detection** (geometry comes from the outer detector that already found
+the face):
+
+1. `embed_kps` — align-warp using the real 5 landmarks from the outer
+   detector, operating on the full frame (preferred when landmarks exist);
+2. `embed_box` — align-warp using the standard 5-point bbox template
+   (insightface proportions), when there are no landmarks;
+3. a plain box crop without padding through the regular `embed`;
+4. if everything fails — the face is skipped and the reason is logged.
+
+Rules:
+
+- Requires a new `libfacedetect.so` built with the
+  `facedetect_capi_embed_rgb_kps` / `facedetect_capi_embed_rgb_box` symbols
+  (patch to [mudler/face-detect.cpp](https://github.com/mudler/face-detect.cpp),
+  [PR #1](https://github.com/mudler/face-detect.cpp/pull/1)). Symbols are
+  registered **lazily**: with the old `.so` the service behaves exactly as
+  before (fallback simply stays disabled).
+- Without `roi`/`upscale`, results are unchanged on frames where the face
+  was already found; frames where the internal detector used to drop the
+  face are now recognized. Typical scores for ~60 px night profiles: 0.29–0.40
+  (top-1 is the correct person, below the 0.5 confidence threshold — the
+  door stays closed, but the event is not lost).
+- Log diagnostics: `engine: face N/M: embed failed (...) — embed_kps OK
+  (box=[...])` means the fallback kicked in; `engine: face N/M dropped at ...`
+  means the face was still discarded, with the reason.
+- Verified A/B on 41 real intercom frames (3 variants × 2 builds): 95/123
+  byte-identical, every difference is a previously-dropped face now found,
+  zero false positives.
+
 Errors use the following shape:
 
 ```json
